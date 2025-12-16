@@ -1,180 +1,262 @@
-const userModells =require("../../Modells/user/user");
+ const userModel =require("../../modells/user/user");
+
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
+const useragent = require("useragent");
+// const useragent = require("useragent");
+const geoip = require("geoip-lite");
+const crypto = require("crypto");
+const createTokensAndSetCookie = require("../../utils/authService");
+const config = require("../../Config/authConfig"); 
 
-const nodemailer = require("nodemailer");
-const getSystemIdentifier = require("../../utils/generateSystemIdentifier");
-const getEmailTemplate = require("../../utils/emailTemplate");
-const session = require("../../Modells/user/session");
-const getSessionVerfication = require("../../utils/sessionverification");
-
-const bcrypt = require("bcryptjs")
 
 
-const userRegister = async function (req, res) {
+
+// Register user
+const userRegister = async (req, res) => {
   try {
-    let { name, emp_id, email, phone, department,gender, role, password,description } = req.body;
+    const { name, emp_id, email, phone, department, gender, role, password, description } = req.body;
 
     if (!name || !emp_id || !email || !password) {
-      return res.status(400).json({ msg: "All fields are required" });
+      return res.status(400).json({ msg: "All required fields must be provided" });
     }
 
-    // Check for existing user with same emp_id or email
-    const existingUser = await userModells.findOne({
-      $or: [{ emp_id }, { email }, { emp_id }],
-    });
+    // Check for existing user
+    const existingUser = await userModel.findOne({ $or: [{ emp_id }, { email }] });
     if (existingUser) {
-      return res
-        .status(409)
-        .json({ msg: "Employee ID, Email, emp_id already exists" });
+      return res.status(409).json({ msg: "Employee ID or Email already exists" });
     }
 
-    // Hash the password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    // const hashedPassword = await bcrypt.hash(password, 10);
 
-    const newuser = new userModells({
+    const newUser = new userModel({
       name,
       emp_id,
-      gender,
       email,
       phone,
       department,
-      role,
       gender,
+      role,
       description,
-      password: hashedPassword,
+      password,
     });
 
-    await newuser.save();
+    await newUser.save();
 
-    res.status(200).json({ msg: "User registered successfully", userID: newuser._id });
+    res.status(200).json({ msg: "User registered successfully", userID: newUser._id });
   } catch (error) {
     res.status(500).json({ msg: "Server error: " + error.message });
   }
 };
 
-
-
-//user-Deleted
-const deleteUser = async function (req, res) {
+// Delete user
+const deleteUser = async (req, res) => {
   const userId = req.params._id;
 
   try {
-    const deletedUser = await userModells.findByIdAndDelete(userId);
+    const deletedUser = await userModel.findByIdAndDelete(userId);
 
-    if (!deletedUser) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!deletedUser) return res.status(404).json({ message: "User not found" });
 
-    res
-      .status(200)
-      .json({ message: "User deleted successfully", user: deletedUser });
+    res.status(200).json({ message: "User deleted successfully", user: deletedUser });
   } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error deleting user", error: error.message });
+    res.status(500).json({ message: "Error deleting user", error: error.message });
   }
 };
 
-const login = async function (req, res) {
-  try {
-    const { name, emp_id, email, password, latitude, longitude, fullAddress } = req.body;
+// Login user
+const login = async (req, res) => {
+ try {
+    const { name, emp_id, email, password } = req.body;
 
+    // 🔹 Basic validation
     if (!password) {
       return res.status(400).json({ msg: "Password is required" });
     }
 
-    const identity = name || emp_id || email;
+    const identity = (name || emp_id || email)?.trim();
     if (!identity) {
-      return res.status(400).json({ msg: "Enter any of username, emp_id, or email" });
+      return res
+        .status(400)
+        .json({ msg: "Enter username, emp_id, or email" });
     }
 
-    const user = await userModells.findOne({
-      $or: [{ name: identity }, { emp_id: identity }, { email: identity }],
-    });
+    // 🔹 Find user (case-insensitive for name/email)
+    const user = await userModel
+      .findOne({
+        $or: [
+          { email: new RegExp(`^${identity}$`, "i") },
+          { name: new RegExp(`^${identity}$`, "i") },
+          { emp_id: identity },
+        ],
+      })
+      .select("+password");
 
     if (!user) {
       return res.status(401).json({ msg: "Invalid credentials" });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
+    // 🔒 Account lock check
+    if (user.isLocked()) {
+      return res.status(423).json({
+        msg: "Account temporarily locked. Try again later.",
+      });
+    }
+
+    // 🔑 Password check
+    const isValid = await user.comparePassword(password);
+    if (!isValid) {
+      user.failedLoginAttempts = (user.failedLoginAttempts || 0) + 1;
+
+      if (user.failedLoginAttempts >= 5) {
+        user.lockUntil = Date.now() + 10 * 60 * 1000; // 10 min
+      }
+
+      await user.save();
       return res.status(401).json({ msg: "Invalid credentials" });
     }
 
-    
-    if (user.department === "imp") {
-      const { device_id, ip } = await getSystemIdentifier(req, res);
-      const registeredDevice = await session.findOne({
-        user_id: user._id,
-        "device_info.device_id": device_id,
-      });
+    // ✅ Successful login → reset attempts
+    user.failedLoginAttempts = 0;
+    user.lockUntil = undefined;
 
-      if (!registeredDevice) {
-        // Generate OTP
-        const otp = Math.floor(100000 + Math.random() * 900000);
-        const otpExpires = Date.now() + 5 * 60 * 1000; 
+    const agent = useragent.parse(req.headers["user-agent"] || "");
+    const ip =
+      req.headers["x-forwarded-for"]?.split(",")[0] ||
+      req.socket.remoteAddress ||
+      req.ip;
 
-        user.otp = otp;
-        user.otpExpires = otpExpires;
-        await user.save();
+    const geo = geoip.lookup(ip);
 
-        const transport = nodemailer.createTransport({
-          host: process.env.EMAIL_HOST,
-          port: parseInt(process.env.EMAIL_PORT),
-          secure: process.env.EMAIL_SECURE === "true",
-          service: process.env.EMAIL_SERVICE,
-          auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASS,
-          },
-        });
+    const fingerprint = crypto
+      .createHash("sha256")
+      .update(agent.toString() + ip)
+      .digest("hex");
 
-        await transport.sendMail({
-          from: `"tracker pvt ltd  Alert" <${process.env.EMAIL_USER}>`,
-          to: `${process.env.EMAIL_ADMIN}`,
-          subject: `Unauthorized Device Login Attempt for ${user.name}`,
-          html: getSessionVerfication(otp, user.emp_id,user.name,device_id, ip, latitude, longitude, fullAddress),
-        });
+    const deviceData = {
+      ip,
+      userAgent: agent.toString(),
+      browser: agent.family,
+      os: agent.os.toString(),
+      device: agent.device.toString(),
+      fingerprint,
+      location: geo
+        ? {
+            country: geo.country,
+            region: geo.region,
+            city: geo.city,
+            timezone: geo.timezone,
+            latitude: geo.ll[0],
+            longitude: geo.ll[1]
+          }
+        : null,
+      lastSeen: new Date()
+    };
 
-        return res.status(403).json({
-          message: "Unrecognized device. OTP has been sent for verification.",
-          email: user.email,
-        });
-      }
+    /* Devices */
+    user.devices = user.devices.filter(
+      d => d.fingerprint !== fingerprint
+    );
+    user.devices.push(deviceData);
 
-      await session.create({
-        user_id: user._id,
-        device_info: {
-          device_id,
-          ip,
-          latitude,
-          longitude,
-        },
-        login_time: new Date(),
-      });
-    }
+    /* Login history (latest 5) */
+    user.loginHistory.unshift({
+      ...deviceData,
+      loggedInAt: new Date()
+    });
+    user.loginHistory = user.loginHistory.slice(0, 5);
 
-    const token = jwt.sign({ userId: user._id }, process.env.PASSKEY);
-    return res.status(200).json({ token, userId: user._id });
-  } catch (error) {
-    res.status(500).json({ message: "Internal Server error", error: error.message });
+    await user.save();
+
+const { accessToken } = await createTokensAndSetCookie(
+  user,
+  req,
+  res
+);
+
+return res.status(200).json({
+  accessToken,
+  expiresIn: config.accessTokenExpiry,
+  msg: "Login successful",
+});
+
+  
+  } catch (err) {
+    console.error("Login error:", err);
+    return res.status(500).json({
+      message: "Login failed",
+      error: err.message,
+    });
+}};
+
+// Get all user
+const getUser = async (req, res) => {
+  try {
+    const data = await userModel.find();
+    res.status(200).json(data);
+  } catch (err) {
+    res.status(500).json({ msg: err.message });
   }
 };
 
-const getuser = async function (req,res) {
-    let data = await userModells.find();
-    res.status(200).json(data)
-    
-}
+// Refresh token
+const refreshToken = async (req, res) => {
+  try {
+    const token = req.cookies?.refreshToken;
+    if (!token) return res.status(401).json({ message: "Missing refresh token" });
 
+    let payload;
+    try {
+      payload = jwt.verify(token, config.jwtRefreshSecret);
+    } catch (e) {
+      return res.status(401).json({ message: "Invalid refresh token" });
+    }
 
+    const user = await userModel.findById(payload.sub);
+    if (!user) return res.status(401).json({ message: "User not found" });
 
-  module.exports={
-    userRegister,
-    deleteUser,
-    login,
-    getuser
+    const tokenRecord = user.refreshTokens.find(t => t.token === token);
+    if (!tokenRecord || tokenRecord.revoked) {
+      user.refreshTokens = [];
+      await user.save();
+      return res.status(401).json({ message: "Refresh token revoked. Please login again." });
+    }
 
-
+    const { accessToken } = await createTokensAndSetCookie(user, res, req, token);
+    res.json({ accessToken, expiresIn: config.accessTokenExpiry });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Refresh failed" });
   }
+};
+//logout 
+
+const logout = async (req, res) => {
+   try {
+    const userId = req.user._id;
+
+    if (!userId) {
+      return res.status(401).json({ msg: "Unauthorized" });
+    }
+    await userModel.updateOne(
+      { _id: userId },
+      { $set: { devices: [] } }
+    );
+    res.clearCookie("refreshToken");
+
+    res.status(200).json({ msg: "Logged out from all devices successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ msg: "Logout failed" });
+  }
+};
+
+
+module.exports = {
+  userRegister,
+  deleteUser,
+  login,
+  getUser,
+  refreshToken,
+  logout,
+};
