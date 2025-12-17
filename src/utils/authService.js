@@ -1,6 +1,6 @@
 // src/services/auth.service.js
 const useragent = require("useragent");
-const userModel = require("../modells/user/user");
+const userModel = require("../modells/user/userModells");
 const config = require("../Config/authConfig");
 
 const {
